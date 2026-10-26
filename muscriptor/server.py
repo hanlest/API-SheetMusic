@@ -41,6 +41,8 @@ import threading
 import time
 import wave
 import zipfile
+from enum import Enum
+from importlib.metadata import version
 from pathlib import Path
 from typing import Annotated, Callable, Literal
 
@@ -91,6 +93,68 @@ _MAX_TRANSCRIBE_MIDI_DURATION_S = 15 * 60
 
 SHEETS_ZIP_NAME = "sheets.zip"
 
+# Enum para OpenAPI/Swagger: desplegable con los nombres exactos del modelo.
+InstrumentGroup = Enum(
+    "InstrumentGroup",
+    {name: name for name in sorted(MT3_FULL_PLUS_GROUP_NAMES)},
+    type=str,
+)
+
+
+def _instruments_form_description() -> str:
+    names_md = "\n".join(
+        f"- `{name}`" for name in sorted(MT3_FULL_PLUS_GROUP_NAMES)
+    )
+    return (
+        "Instrumentos que pueden sonar en la grabación. En multipart, repita el "
+        "campo `instruments` una vez por valor (p. ej. `instruments=violin` y "
+        "`instruments=drums`).\n\n"
+        "**Detección automática:** no envíe el campo `instruments` (en Swagger, "
+        "déjelo sin añadir filas; no use valores vacíos).\n\n"
+        f"**Listado completo ({len(MT3_FULL_PLUS_GROUP_NAMES)} nombres):**\n\n"
+        f"{names_md}"
+    )
+
+
+def _instruments_for_model(groups: list[InstrumentGroup]) -> list[str] | None:
+    if not groups:
+        return None
+    return [g.value for g in groups]
+
+
+_OPENAPI_TAGS = [
+    {
+        "name": "sistema",
+        "description": "Comprobaciones de estado y recursos auxiliares del servidor.",
+    },
+    {
+        "name": "transcripción",
+        "description": "Convierte audio en eventos de notas, MIDI y metadatos de tempo.",
+    },
+    {
+        "name": "exportación",
+        "description": "Genera archivos MIDI o partituras a partir de una transcripción.",
+    },
+    {
+        "name": "audio",
+        "description": "Síntesis y mezcla del MIDI transcrito con el audio original.",
+    },
+]
+
+_API_DESCRIPTION = """
+API HTTP de **MuScriptor** para transcribir grabaciones a MIDI y partitura.
+
+### Flujo habitual
+1. **POST /transcribe** — sube audio y recibe eventos en tiempo real (SSE) más un MIDI final en base64.
+2. **POST /export** — vuelve a generar el `.mid` con opciones de cuantización y tempo (sin volver a ejecutar el modelo).
+3. **POST /sheets** — graba partituras (PDF, MusicXML, etc.) en un ZIP; requiere MuseScore 4+ en el servidor.
+
+### Alternativa sin SSE
+**POST /transcribe/midi** devuelve el archivo MIDI directamente (máximo 15 minutos de audio).
+
+Documentación interactiva: **/docs** (Swagger UI). Esquema OpenAPI: **/openapi.json**.
+"""
+
 
 def engrave_to_zip(midi_bytes: bytes, quantized: bool = False) -> bytes:
     """Engrave `midi_bytes` and pack everything written into one zip.
@@ -114,45 +178,80 @@ def engrave_to_zip(midi_bytes: bytes, quantized: bool = False) -> bytes:
 
 
 class ExportNote(BaseModel):
-    """A note as /transcribe streamed it: times not yet moved by `onset_delay`."""
+    """Una nota tal como la envió /transcribe (tiempos sin restar `onset_delay`)."""
 
-    instrument: str
-    pitch: int = Field(ge=0, le=127)
-    start: float
-    end: float
+    instrument: str = Field(description="Nombre del grupo de instrumento (véase GET /instruments).")
+    pitch: int = Field(ge=0, le=127, description="Altura MIDI (0–127).")
+    start: float = Field(description="Inicio en segundos.")
+    end: float = Field(description="Fin en segundos.")
 
 
 class ExportGrid(BaseModel):
-    """The `beat_grid` /transcribe sent, passed back as it came."""
+    """La rejilla de pulsos (`beat_grid`) devuelta por /transcribe, reenviada tal cual."""
 
-    bpm: float = Field(gt=0)
-    beats_per_bar: int | None = None
-    first_downbeat: float = 0.0
-    onset_delay: float = 0.0
-    beat_subdivision: int | None = None
-    steady: bool = True
-    beats: list[float] | None = None
+    bpm: float = Field(gt=0, description="Tempo en pulsos por minuto.")
+    beats_per_bar: int | None = Field(
+        default=None, description="Compás detectado (pulsos por compás)."
+    )
+    first_downbeat: float = Field(
+        default=0.0, description="Segundo del primer tiempo fuerte."
+    )
+    onset_delay: float = Field(
+        default=0.0,
+        description="Retardo en segundos entre los tiempos y las notas transmitidas.",
+    )
+    beat_subdivision: int | None = Field(
+        default=None, description="Subdivisión por defecto al cuantizar en /export."
+    )
+    steady: bool = Field(
+        default=True,
+        description="Si los tiempos encajan con un BPM constante.",
+    )
+    beats: list[float] | None = Field(
+        default=None, description="Posiciones en segundos de cada pulso (null si no hay)."
+    )
 
 
 class ExportSettings(BaseModel):
-    """`ExportOptions`, with the bounds a client could get wrong."""
+    """Opciones de exportación MIDI (`ExportOptions`)."""
 
-    bpm: float | None = Field(default=None, ge=20, le=400)
-    beats_per_bar: int | None = Field(default=None, ge=1, le=32)
-    first_downbeat: float | None = None
-    tempo_map: bool | None = None
-    beat_scale: Literal[0.25, 0.5, 1, 2, 4] = 1
-    quantize: bool = False
-    subdivision: int | None = Field(default=None, ge=1, le=32)
-    strength: float = Field(default=1.0, ge=0, le=1)
-    fill_gaps: float = Field(default=0.0, ge=0, le=16)
-    trim_leading_bars: bool = False
+    bpm: float | None = Field(default=None, ge=20, le=400, description="Tempo manual.")
+    beats_per_bar: int | None = Field(
+        default=None, ge=1, le=32, description="Compás manual."
+    )
+    first_downbeat: float | None = Field(
+        default=None, description="Primer tiempo fuerte manual."
+    )
+    tempo_map: bool | None = Field(
+        default=None, description="Usar mapa de tempo si el pulso no es constante."
+    )
+    beat_scale: Literal[0.25, 0.5, 1, 2, 4] = Field(
+        default=1, description="Escala de la rejilla de pulsos."
+    )
+    quantize: bool = Field(default=False, description="Ajustar notas a la rejilla.")
+    subdivision: int | None = Field(
+        default=None, ge=1, le=32, description="Subdivisión al cuantizar."
+    )
+    strength: float = Field(
+        default=1.0, ge=0, le=1, description="Intensidad de la cuantización (0–1)."
+    )
+    fill_gaps: float = Field(
+        default=0.0, ge=0, le=16, description="Rellenar huecos menores (en subdivisiones)."
+    )
+    trim_leading_bars: bool = Field(
+        default=False, description="Recortar compases iniciales vacíos."
+    )
 
 
 class ExportRequest(BaseModel):
-    notes: list[ExportNote]
-    beat_grid: ExportGrid | None = None
-    options: ExportSettings = ExportSettings()
+    notes: list[ExportNote] = Field(description="Notas obtenidas del flujo SSE de /transcribe.")
+    beat_grid: ExportGrid | None = Field(
+        default=None, description="Rejilla de tempo devuelta en `transcription_complete`."
+    )
+    options: ExportSettings = Field(
+        default_factory=ExportSettings,
+        description="Ajustes de cuantización, tempo y compás.",
+    )
 
 
 def export_events(notes: list[ExportNote]) -> list[NoteStartEvent | NoteEndEvent]:
@@ -180,7 +279,15 @@ def event_to_dict(ev: NoteStartEvent | NoteEndEvent) -> dict:
 
 
 def create_app(model: TranscriptionModel, web_dir: str | Path | None = None) -> FastAPI:
-    app = FastAPI(title="muscriptor")
+    app = FastAPI(
+        title="MuScriptor API",
+        description=_API_DESCRIPTION,
+        version=version("muscriptor"),
+        openapi_tags=_OPENAPI_TAGS,
+        docs_url="/docs",
+        redoc_url="/redoc",
+        openapi_url="/openapi.json",
+    )
 
     transcribe_lock = threading.Lock()
     # State of the run currently holding the lock (or the last one to have held
@@ -263,31 +370,97 @@ def create_app(model: TranscriptionModel, web_dir: str | Path | None = None) -> 
             current_client = client_id
         return cancel, _make_release_once(transcribe_lock)
 
-    @app.get("/health")
+    @app.get(
+        "/health",
+        tags=["sistema"],
+        summary="Estado del servidor",
+        description="Comprueba que el proceso HTTP responde correctamente.",
+    )
     async def health():
         return {"status": "ok"}
 
-    @app.get("/instruments")
+    @app.get(
+        "/instruments",
+        tags=["sistema"],
+        summary="Instrumentos admitidos",
+        description=(
+            "Lista canónica de nombres para el campo `instruments` de "
+            "/transcribe y /transcribe/midi. Use el string exacto (p. ej. "
+            "`acoustic_piano`, no «piano»)."
+        ),
+    )
     async def list_instruments():
-        return {"instruments": list(MT3_FULL_PLUS_GROUP_NAMES.keys())}
+        return {
+            "instruments": sorted(MT3_FULL_PLUS_GROUP_NAMES.keys()),
+            "usage": (
+                "multipart: repita `instruments=<nombre>` por instrumento; "
+                "omita el campo para detección automática."
+            ),
+        }
 
-    @app.get("/soundfonts/MuseScore_General.sf3")
+    @app.get(
+        "/soundfonts/MuseScore_General.sf3",
+        tags=["sistema"],
+        summary="Soundfont para la interfaz web",
+        description=(
+            "Descarga (y cachea en disco) el soundfont comprimido usado por el "
+            "sintetizador en el navegador."
+        ),
+    )
     async def soundfont() -> FileResponse:
-        """Compressed soundfont for the web UI's in-browser synthesizer.
-
-        Fetched from SF3_URL on first request (in a worker thread, so the
-        event loop keeps serving) and cached locally.
-        """
         path = await asyncio.to_thread(download_if_necessary, SF3_URL)
         return FileResponse(path, media_type="application/octet-stream")
 
-    @app.post("/transcribe")
+    @app.post(
+        "/transcribe",
+        tags=["transcripción"],
+        summary="Transcribir audio (eventos SSE)",
+        description=(
+            "Sube un archivo de audio (`multipart/form-data`, campo **file**). "
+            "Formatos habituales: WAV, MP3, FLAC, OGG, M4A (vía libsndfile).\n\n"
+            "La respuesta es `text/event-stream`. Cada evento JSON incluye `type`:\n"
+            "- `start` / `end`: notas (misma forma que en la CLI)\n"
+            "- `progress`: avance por fragmentos `{completed, total}`\n"
+            "- `transcription_complete`: MIDI en base64 (`data`) y `beat_grid` "
+            "(tempo, compás, `onset_delay`, `steady`, lista `beats`, etc.)\n\n"
+            "Solo puede ejecutarse una transcripción a la vez en el servidor. "
+            "La cabecera opcional **X-Client-Id** permite que una nueva petición "
+            "del mismo cliente cancele la anterior.\n\n"
+            "Errores habituales: **400** audio ilegible o instrumento desconocido; "
+            "**503** servidor ocupado.\n\n"
+            "Véase el campo **instruments** para el listado de nombres válidos."
+        ),
+    )
     async def transcribe(
-        file: Annotated[UploadFile, File()],
-        instruments: Annotated[list[str], Form(default_factory=list)],
-        # "true" fails loudly on tempo detection errors, "false" doesn't even try
-        detect_tempo: Annotated[TempoDetection, Form()] = "best-effort",
-        x_client_id: Annotated[str | None, Header()] = None,
+        file: Annotated[
+            UploadFile,
+            File(description="Archivo de audio a transcribir."),
+        ],
+        instruments: Annotated[
+            list[InstrumentGroup],
+            Form(
+                description=_instruments_form_description(),
+                default_factory=list,
+            ),
+        ],
+        detect_tempo: Annotated[
+            TempoDetection,
+            Form(
+                description=(
+                    "Detección de tempo: `false` (no intentar), `true` (fallar si falla), "
+                    "`best-effort` (intentar sin error)."
+                ),
+            ),
+        ] = "best-effort",
+        x_client_id: Annotated[
+            str | None,
+            Header(
+                description=(
+                    "Identificador de cliente (p. ej. pestaña del navegador). "
+                    "Mismo id: la nueva transcripción cancela la anterior."
+                ),
+            ),
+        ] = None,
     ) -> StreamingResponse:
         data = await file.read()
         # PCM WAV goes through the stdlib reader (keeps WAV decoding byte-for-byte
@@ -307,12 +480,7 @@ def create_app(model: TranscriptionModel, web_dir: str | Path | None = None) -> 
                     detail=f"could not decode audio file '{file.filename}': {e}",
                 ) from e
 
-        unknown = [n for n in instruments if n not in MT3_FULL_PLUS_GROUP_NAMES]
-        if unknown:
-            raise HTTPException(
-                status_code=400,
-                detail=f"unknown instrument name(s): {', '.join(unknown)}",
-            )
+        instrument_names = _instruments_for_model(instruments)
 
         # Acquire the single-transcription lock, preempting only a resubmit from
         # this same client (see acquire_transcribe_lock). `release_lock` runs
@@ -334,7 +502,7 @@ def create_app(model: TranscriptionModel, web_dir: str | Path | None = None) -> 
                 # warns (and keeps its notes) instead of aborting the whole stream.
                 for ev in model.transcribe(
                     (wav, sr),
-                    instruments=instruments or None,
+                    instruments=instrument_names,
                     batch_size=1,
                     no_eos_is_ok=True,
                 ):
@@ -419,21 +587,40 @@ def create_app(model: TranscriptionModel, web_dir: str | Path | None = None) -> 
             headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
         )
 
-    @app.post("/transcribe/midi")
+    @app.post(
+        "/transcribe/midi",
+        tags=["transcripción"],
+        summary="Transcribir audio (archivo MIDI)",
+        description=(
+            "Igual que /transcribe en cuanto a entrada (audio + instrumentos + "
+            "`detect_tempo`), pero **bloquea** hasta terminar y devuelve "
+            "`audio/midi` con cabecera de descarga (sin SSE ni base64).\n\n"
+            "Límite de duración: **15 minutos** (**413** si se supera). "
+            "**422** si `detect_tempo=true` y falla la detección de tempo. "
+            "**503** si otra transcripción está en curso."
+        ),
+    )
     async def transcribe_midi(
-        file: Annotated[UploadFile, File()],
-        instruments: Annotated[list[str], Form(default_factory=list)],
-        # "true" fails loudly on tempo detection errors, "false" doesn't even try
-        detect_tempo: Annotated[TempoDetection, Form()] = "best-effort",
-        x_client_id: Annotated[str | None, Header()] = None,
+        file: Annotated[
+            UploadFile,
+            File(description="Archivo de audio a transcribir."),
+        ],
+        instruments: Annotated[
+            list[InstrumentGroup],
+            Form(
+                description=_instruments_form_description(),
+                default_factory=list,
+            ),
+        ],
+        detect_tempo: Annotated[
+            TempoDetection,
+            Form(description="Modo de detección de tempo (véase /transcribe)."),
+        ] = "best-effort",
+        x_client_id: Annotated[
+            str | None,
+            Header(description="Identificador de cliente (véase /transcribe)."),
+        ] = None,
     ) -> Response:
-        """Transcribe an audio file and return the .mid file directly.
-
-        Unlike /transcribe, this blocks until transcription finishes and
-        returns the raw MIDI bytes (no SSE, no base64) with a
-        Content-Disposition header, so a plain HTTP client can save the
-        response straight to disk.
-        """
         data = await file.read()
         try:
             wav, sr = _read_wav_file(io.BytesIO(data))
@@ -456,12 +643,7 @@ def create_app(model: TranscriptionModel, web_dir: str | Path | None = None) -> 
                 ),
             )
 
-        unknown = [n for n in instruments if n not in MT3_FULL_PLUS_GROUP_NAMES]
-        if unknown:
-            raise HTTPException(
-                status_code=400,
-                detail=f"unknown instrument name(s): {', '.join(unknown)}",
-            )
+        instrument_names = _instruments_for_model(instruments)
 
         # Same mutual exclusion as /transcribe, via the shared helper. This run
         # is not cancellable (it doesn't stream, so there's nothing to stop
@@ -476,7 +658,7 @@ def create_app(model: TranscriptionModel, web_dir: str | Path | None = None) -> 
             midi_bytes, _ = await asyncio.to_thread(
                 model.transcribe_and_postprocess,
                 (wav, sr),
-                instruments=instruments or None,
+                instruments=instrument_names,
                 detect_tempo=detect_tempo,
             )
         except BeatDetectionError as e:
@@ -492,13 +674,18 @@ def create_app(model: TranscriptionModel, web_dir: str | Path | None = None) -> 
             headers={"Content-Disposition": 'attachment; filename="result.mid"'},
         )
 
-    @app.post("/export")
+    @app.post(
+        "/export",
+        tags=["exportación"],
+        summary="Exportar MIDI desde notas",
+        description=(
+            "Recibe en JSON las notas del SSE, la `beat_grid` opcional y "
+            "`options` (tempo, compás, cuantización, etc.). Devuelve un archivo "
+            "**MIDI** (`audio/midi`). No ejecuta el modelo ni usa el candado de "
+            "/transcribe, así que es barato para reexportar al cambiar opciones."
+        ),
+    )
     async def export(request: ExportRequest) -> Response:
-        """Write the notes /transcribe streamed as MIDI, with export options.
-
-        No model and no lock: this only rebuilds the file, so it is cheap
-        enough to call on every download.
-        """
         unknown = sorted(
             {n.instrument for n in request.notes} - MT3_FULL_PLUS_GROUP_NAMES.keys()
         )
@@ -522,17 +709,28 @@ def create_app(model: TranscriptionModel, web_dir: str | Path | None = None) -> 
         )
         return Response(content=midi_bytes, media_type="audio/midi")
 
-    @app.post("/auralize")
+    @app.post(
+        "/auralize",
+        tags=["audio"],
+        summary="Preescuchar transcripción (WAV)",
+        description=(
+            "Renderiza el MIDI subido a audio WAV.\n\n"
+            "- **mix**: estéreo — audio original (izquierda) + síntesis FluidSynth "
+            "(derecha); requiere también el campo **audio**.\n"
+            "- **synth**: mono, solo la síntesis."
+        ),
+    )
     async def auralize(
-        midi: Annotated[UploadFile, File()],
-        audio: Annotated[UploadFile | None, File()] = None,
-        mode: Annotated[str, Form()] = "mix",
+        midi: Annotated[UploadFile, File(description="Archivo MIDI transcrito.")],
+        audio: Annotated[
+            UploadFile | None,
+            File(description="Audio original; obligatorio si `mode=mix`."),
+        ] = None,
+        mode: Annotated[
+            str,
+            Form(description="`mix` (mezcla con el original) o `synth` (solo síntesis)."),
+        ] = "mix",
     ):
-        """Render a transcription as WAV.
-
-        mode="mix": stereo, original audio (L) + FluidSynth synthesis (R);
-        requires the `audio` upload. mode="synth": mono, just the synthesis.
-        """
         from muscriptor.utils.auralization import auralize as do_auralize
         from muscriptor.utils.auralization import synthesize
 
@@ -582,23 +780,31 @@ def create_app(model: TranscriptionModel, web_dir: str | Path | None = None) -> 
 
         return Response(content=wav_bytes, media_type="audio/wav")
 
-    @app.post("/sheets")
+    @app.post(
+        "/sheets",
+        tags=["exportación"],
+        summary="Partituras en ZIP",
+        description=(
+            "Sube un MIDI (idealmente cuantizado desde /export con "
+            "`quantize=true`) y devuelve un **ZIP** sin comprimir con MusicXML, "
+            "partitura completa y un PDF por instrumento.\n\n"
+            "Requiere **MuseScore 4+** instalado en el servidor (**503** si no "
+            "está disponible). El campo **quantized** indica que el MIDI ya está "
+            "alineado a la rejilla; este endpoint no cuantiza por sí mismo."
+        ),
+    )
     async def sheets(
-        midi: Annotated[UploadFile, File()],
-        quantized: Annotated[bool, Form()] = False,
+        midi: Annotated[UploadFile, File(description="Archivo MIDI a grabar.")],
+        quantized: Annotated[
+            bool,
+            Form(
+                description=(
+                    "True si el MIDI proviene de /export con cuantización "
+                    "(recomendado para la notación)."
+                ),
+            ),
+        ] = False,
     ) -> Response:
-        """Engrave a MIDI file as sheet music, returned as one zip.
-
-        The whole set is rendered in one go — MuseScore is slow enough that a
-        round trip per file would be worse — so the caller gets every PDF, the
-        MusicXML and the MIDI in a single uncompressed archive and picks from it
-        locally. Requires MuseScore 4+ on the server (503 without it).
-
-        `quantized` says the upload is already snapped to a beat grid — a
-        quantized MIDI from /export — which is what the notation should be
-        engraved from. Without it the engraving keeps the timing jitter, so this
-        does not quantize anything itself.
-        """
         midi_bytes = await midi.read()
 
         try:

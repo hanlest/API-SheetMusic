@@ -96,6 +96,21 @@ def test_event_to_dict_start_and_end():
     }
 
 
+def test_openapi_docs_in_spanish(tmp_path):
+    web_dir = tmp_path / "web"
+    web_dir.mkdir()
+    (web_dir / "index.html").write_text("<html>ui</html>")
+    client = TestClient(create_app(make_model(), web_dir=web_dir))
+
+    assert client.get("/docs").status_code == 200
+    spec = client.get("/openapi.json").json()
+    assert spec["info"]["title"] == "MuScriptor API"
+    assert "Documentación interactiva" in spec["info"]["description"]
+    post = spec["paths"]["/transcribe"]["post"]
+    assert post["summary"] == "Transcribir audio (eventos SSE)"
+    assert post["tags"] == ["transcripción"]
+
+
 def test_transcribe_streams_sse_events(tmp_path):
     s0 = NoteStartEvent(pitch=60, start_time=0.0, index=0, instrument="piano")
     s1 = NoteStartEvent(pitch=64, start_time=0.1, index=1, instrument="guitar")
@@ -267,6 +282,17 @@ def test_transcribe_rejects_undecodable_file():
     assert resp.status_code == 400
 
 
+def test_transcribe_omitted_instruments_uses_auto_detect(tmp_path):
+    model = make_model()
+    client = TestClient(create_app(model))
+    resp = client.post(
+        "/transcribe",
+        files={"file": ("silent.wav", _wav_bytes(tmp_path), "audio/wav")},
+    )
+    assert resp.status_code == 200
+    assert model.transcribe.call_args.kwargs["instruments"] is None
+
+
 def test_transcribe_passes_instruments(tmp_path):
     model = make_model()
     client = TestClient(create_app(model))
@@ -330,7 +356,7 @@ def test_transcribe_midi_rejects_unknown_instrument(tmp_path):
         files={"file": ("silent.wav", _wav_bytes(tmp_path), "audio/wav")},
         data={"instruments": ["not_a_real_instrument"]},
     )
-    assert resp.status_code == 400
+    assert resp.status_code in (400, 422)
 
 
 def test_transcribe_midi_rejects_audio_over_duration_limit(tmp_path, monkeypatch):
