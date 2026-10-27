@@ -1,6 +1,7 @@
 """TranscriptionModel: main user-facing entry point."""
 
 import contextlib
+import gc
 import io
 import json
 import math
@@ -264,11 +265,27 @@ class TranscriptionModel:
         Path("out.mid").write_bytes(model.transcribe_and_postprocess("audio.wav")[0])
     """
 
-    def __init__(self, model: LMModel, tokenizer: MT3Tokenizer, device: torch.device):
+    def __init__(
+        self,
+        model: LMModel | None,
+        tokenizer: MT3Tokenizer,
+        device: torch.device,
+        *,
+        weights_source: str | Path | None = None,
+        weights_path: Path | None = None,
+        compute_dtype: torch.dtype = torch.float32,
+    ):
         self._model = model
         self._tokenizer = tokenizer
         self._device = device
+        self._weights_source = weights_source
+        self._weights_path = weights_path
+        self._compute_dtype = compute_dtype
         self._instrument_for_program = _build_instrument_for_program(tokenizer)
+
+    @property
+    def weights_loaded(self) -> bool:
+        return self._model is not None
 
     @classmethod
     def load_model(
@@ -311,6 +328,67 @@ class TranscriptionModel:
 
         source = _resolve_source(weights_path)
         weights_path = download_if_necessary(source)
+
+        tokenizer = MT3Tokenizer(
+            instrument_vocabulary="MT3_FULL_PLUS",
+            max_shift_steps=1001,
+        )
+
+        instance = cls(
+            model=None,
+            tokenizer=tokenizer,
+            device=device,
+            weights_source=source,
+            weights_path=weights_path,
+            compute_dtype=dtype,
+        )
+        instance.ensure_weights_loaded()
+        return instance
+
+    @classmethod
+    def create_export_shell(cls, device: torch.device | None = None) -> "TranscriptionModel":
+        """Tokenizer-only instance for /export (no transformer weights)."""
+        if device is None:
+            device = torch.device("cpu")
+        tokenizer = MT3Tokenizer(
+            instrument_vocabulary="MT3_FULL_PLUS",
+            max_shift_steps=1001,
+        )
+        return cls(
+            model=None,
+            tokenizer=tokenizer,
+            device=device,
+            weights_source=None,
+            weights_path=None,
+        )
+
+    def ensure_weights_loaded(self) -> None:
+        """Load transformer weights onto ``self._device`` if they were released."""
+        if self._model is not None:
+            return
+        if self._weights_path is None or self._weights_source is None:
+            raise RuntimeError("This TranscriptionModel has no weights to load.")
+        self._model = self._build_loaded_lm()
+
+    def release_accelerator_memory(self) -> None:
+        """Drop transformer weights from GPU/VRAM; keeps the tokenizer for export."""
+        if self._model is None:
+            return
+        lm = self._model
+        self._model = None
+        del lm
+        gc.collect()
+        if self._device.type == "cuda":
+            torch.cuda.empty_cache()
+        elif self._device.type == "mps" and hasattr(torch.mps, "empty_cache"):
+            torch.mps.empty_cache()
+
+    def _build_loaded_lm(self) -> LMModel:
+        source = self._weights_source
+        weights_path = self._weights_path
+        assert source is not None and weights_path is not None
+        device = self._device
+        dtype = self._compute_dtype
         model = _build_model(device, _resolve_config(source, weights_path))
         model.eval()
 
@@ -320,16 +398,8 @@ class TranscriptionModel:
         model.to(device)
         if dtype != torch.float32:
             model.to(dtype)
-            # Conditioners keep fp32 numerics (log-mel of quiet passages
-            # underflows in fp16); LMModel.forward casts their outputs.
             model.condition_provider.float()
-
-        tokenizer = MT3Tokenizer(
-            instrument_vocabulary="MT3_FULL_PLUS",
-            max_shift_steps=1001,
-        )
-
-        return cls(model=model, tokenizer=tokenizer, device=device)
+        return model
 
     # ------------------------------------------------------------------
     def transcribe(
@@ -376,6 +446,7 @@ class TranscriptionModel:
         ``completed == 0``, then one as each chunk finishes. Consumers that
         only care about notes can ignore them.
         """
+        self.ensure_weights_loaded()
         batch_size = self._resolve_batch_size(batch_size, prelude_forcing)
 
         # Exact names only here — the CLI resolves abbreviations before

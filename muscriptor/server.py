@@ -56,7 +56,10 @@ from starlette.background import BackgroundTask
 from muscriptor.events import NoteEndEvent, NoteStartEvent, ProgressEvent
 from muscriptor.soundfonts import SF3_URL
 from muscriptor.tokenizer.mt3 import MT3_FULL_PLUS_GROUP_NAMES
+from muscriptor.idle_runtime import IdleModelRuntime
 from muscriptor.transcription_model import TranscriptionModel
+
+ModelHandle = TranscriptionModel | IdleModelRuntime
 from muscriptor.utils.audio import _read_non_wav_file, _read_wav_file
 from muscriptor.utils.beats import BeatDetectionError, BeatGrid, TempoDetection
 from muscriptor.utils.download import download_if_necessary
@@ -278,7 +281,8 @@ def event_to_dict(ev: NoteStartEvent | NoteEndEvent) -> dict:
     }
 
 
-def create_app(model: TranscriptionModel, web_dir: str | Path | None = None) -> FastAPI:
+def create_app(model: ModelHandle, web_dir: str | Path | None = None) -> FastAPI:
+    lifespan = model.lifespan() if isinstance(model, IdleModelRuntime) else None
     app = FastAPI(
         title="MuScriptor API",
         description=_API_DESCRIPTION,
@@ -287,6 +291,7 @@ def create_app(model: TranscriptionModel, web_dir: str | Path | None = None) -> 
         docs_url="/docs",
         redoc_url="/redoc",
         openapi_url="/openapi.json",
+        lifespan=lifespan,
     )
 
     transcribe_lock = threading.Lock()
@@ -377,7 +382,12 @@ def create_app(model: TranscriptionModel, web_dir: str | Path | None = None) -> 
         description="Comprueba que el proceso HTTP responde correctamente.",
     )
     async def health():
-        return {"status": "ok"}
+        payload: dict[str, object] = {"status": "ok"}
+        if isinstance(model, IdleModelRuntime):
+            payload["model_weights_loaded"] = model.weights_loaded
+        elif isinstance(model, TranscriptionModel):
+            payload["model_weights_loaded"] = model.weights_loaded
+        return payload
 
     @app.get(
         "/instruments",

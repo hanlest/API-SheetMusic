@@ -572,14 +572,30 @@ def serve(
 
     from muscriptor.server import create_app
 
+    from muscriptor.idle_runtime import IdleModelRuntime, idle_unload_seconds_from_env
+
     logging.basicConfig(
         level=logging.INFO, format="%(levelname)s %(name)s: %(message)s"
     )
 
     _device = None if device == "auto" else device
-    typer.echo("Loading model…")
-    model = _load_model(model_path, _device, dtype)
+    idle_seconds = idle_unload_seconds_from_env()
     web_dir = Path(__file__).resolve().parent / "web_dist"
+    if idle_seconds > 0:
+        typer.echo(
+            f"Modelo bajo demanda: se carga al transcribir y se libera VRAM tras "
+            f"{idle_seconds:g}s sin uso (MUSCRIPTOR_IDLE_UNLOAD_SECONDS=0 para desactivar).",
+            err=True,
+        )
+        model = IdleModelRuntime(
+            weights_path=model_path,
+            device=_device,
+            dtype=dtype,
+            idle_seconds=idle_seconds,
+        )
+    else:
+        typer.echo("Loading model…", err=True)
+        model = _load_model(model_path, _device, dtype)
     fastapi_app = create_app(model, web_dir=web_dir if web_dir.is_dir() else None)
     uvicorn.run(fastapi_app, host=host, port=port)
 
