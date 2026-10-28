@@ -1,4 +1,4 @@
-/** PM2: pm2 start ecosystem.config.cjs  |  pm2 logs muscriptor-api */
+/** PM2: pm2 start ecosystem.config.cjs  |  pm2 logs API-SheetMusic */
 const fs = require('fs')
 const path = require('path')
 
@@ -17,7 +17,7 @@ const port = process.env.MUSCRIPTOR_PORT || '8222'
 module.exports = {
   apps: [
     {
-      name: 'muscriptor-api',
+      name: 'API-SheetMusic',
       cwd: root,
       script: muscriptorExe,
       args: `serve --host ${host} --port ${port} --device ${device}`,

@@ -1,5 +1,5 @@
 @echo off
-rem Detiene el proceso PM2 muscriptor-api (creado con pm2-start.bat).
+rem Detiene el proceso PM2 API-SheetMusic (creado con pm2-start.bat).
 
 setlocal EnableExtensions
 cd /d "%~dp0"
@@ -7,7 +7,7 @@ cd /d "%~dp0"
 set "ARG1=%~1"
 if /I "%ARG1%"=="__run__" set "ARG1="
 
-set "APP_NAME=muscriptor-api"
+set "APP_NAME=API-SheetMusic"
 
 where pm2 >nul 2>&1
 if errorlevel 1 (

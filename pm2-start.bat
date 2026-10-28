@@ -20,7 +20,7 @@ exit /b 0
 set "ARG1=%~1"
 if /I "%ARG1%"=="__run__" set "ARG1="
 
-set "APP_NAME=muscriptor-api"
+set "APP_NAME=API-SheetMusic"
 set "UV_LINK_MODE=copy"
 
 call :load_dotenv
@@ -40,6 +40,7 @@ if not exist "ecosystem.config.cjs" (
 )
 
 rem Libera torch en disco antes de uv pip (evita "Acceso denegado" si la API estaba en PM2).
+call pm2 delete muscriptor-api >nul 2>&1
 call pm2 describe "%APP_NAME%" >nul 2>&1
 if not errorlevel 1 (
     echo Deteniendo "%APP_NAME%" en PM2 antes de preparar el entorno...
